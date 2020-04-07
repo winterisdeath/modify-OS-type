@@ -1,235 +1,195 @@
 #include "mw.h"
 #include "ui_mw.h"
-#include "QDebug"
 #include "bridge.cpp"
+#include <QCheckBox>
 
 mw::mw(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::mw)
 {
     ui->setupUi(this);
-    get_ip_src(2);
-    ui->gbox_param->setEnabled(false);
-    
-    connect(ui->rb_auto, SIGNAL(clicked()), this, SLOT(click_auto()));
-    connect(ui->rb_semi, SIGNAL(clicked()), this, SLOT(click_semi()));
-    connect(ui->rb_manual, SIGNAL(clicked()), this, SLOT(click_manual()));
-    //    connect(ui->cb_ttl, SIGNAL(stateChanged()), this, SLOT(click_ttl()));
-    //    connect(ui->cb_ip, SIGNAL(stateChanged()), this, SLOT(click_ip_dst()));
-    //    connect(ui->cb_ip, SIGNAL(stateChanged()), this, SLOT(click_ip_src()));
-    
+
+
+    connect(ui->rb_host_all, SIGNAL(clicked()), this, SLOT(host_all()));
+    connect(ui->rb_host_one, SIGNAL(clicked()), this, SLOT(host_one()));
+
     connect(ui->pb_capture, SIGNAL(clicked()), this, SLOT(start_capturing()));
     connect(ui->pb_exit, SIGNAL(clicked()), this, SLOT(exit_capture()));
-    
+
+    /* SLOTS for changing tabs */
+    connect(ui->tabWidget, SIGNAL(currentChanged(int)), this, SLOT(change_tab(int)));
+
+    /* SLOT for refresh FP database */
+    //        connect(new_wind, SIGNAL(ret_signal(int)), this, SLOT(new_func(int)));
+    connect(tcp_opt_widget, SIGNAL(refresh_signal()), this, SLOT(open_fp_database()));
+
     /* Chosing adapters */
     QStringList devs = get_all_devs();
     ui->comb_adapter_1->addItems(devs);
     ui->comb_adapter_2->addItems(devs);
-/*
-    u_char* packet;
-    u_int size;
-    size = 20;
-    manual_wind *wind = new manual_wind(packet, &size);
-    wind->show();
-    */
+    if (ui->comb_adapter_1->currentText() == ui->comb_adapter_2->currentText()
+            && devs.size() > 1)
+        ui->comb_adapter_2->setCurrentIndex(ui->comb_adapter_2->currentIndex() + 1);
+
+    connect(ui->rb_host_all, SIGNAL(clicked()), this, SLOT(host_all()));
+    connect(ui->rb_host_one, SIGNAL(clicked()), this, SLOT(host_one()));
+
+    /* get info from fingerprint database */
+    open_fp_database();
+
+    /* select protection of all hosts */
+    ui->rb_host_all->click();
+
+    /* Add manual mod */
+    ui->tabWidget->addTab(tcp_opt_widget, "Manual");
+
+
 }
 
 mw::~mw()
 {
+    pcap_close(adhandle1);
+    pcap_close(adhandle2);
+    pcap_freealldevs(alldevs);
     delete ui;
 }
 
-void mw::click_auto()
+void mw::open_fp_database()
 {
-    ui->gbox_param->setEnabled(false);
-    _auto = true;
-    _semi = false;
-    _manual = false;
-}
+    os_list.clear();
 
-
-void mw::click_semi()
-{
-    ui->gbox_param->setEnabled(true);
-    
-    _auto = false;
-    _semi = true;
-    _manual = false;
-    
-    //    click_ttl();
-    //    click_ip_dst();
-    //    click_ip_src();
-    
-}
-
-void mw::click_manual()
-{
-    ui->gbox_param->setEnabled(false);
-    
-    _auto = false;
-    _semi = false;
-    _manual = true;
-}
-
-
-void mw::click_ttl()
-{
-    qDebug() << "Click ttl!";
-    if (ui->cb_ttl->isChecked()){
-        ui->sp_ttl_old->setEnabled(true);
-        ui->sp_ttl_new->setEnabled(true);
-    } else {
-        ui->sp_ttl_old->setEnabled(false);
-        ui->sp_ttl_new->setEnabled(false);
+    QString fname;
+    fname = "/home/snow/C++/tcp_small.xml";
+    if (fname.isEmpty()){
+        QMessageBox::critical(this, QString("Error"), QString("Path to file is emtry!"));
+        exit(-1);
     }
+
+    QFile file(fname);
+    file.open(QIODevice::ReadOnly);
+
+    if (!file.isOpen()) {
+        QMessageBox::critical(this, QString("Error"), QString("File not opened!"));
+        exit(-1);
+    }
+
+    QDomDocument xml;
+    if (!xml.setContent(&file)) {
+        QMessageBox::critical(this, QString("Error"), QString("Can't read xml!"));
+        exit(-1);
+    }
+
+    QDomElement elem;
+    elem = xml.documentElement();
+    qDebug() << " ---" << elem.tagName();
+
+    if (elem.tagName() == "fingerprints") {
+        for (QDomElement temp = xml.documentElement().firstChildElement();
+             !temp.isNull(); temp = temp.nextSiblingElement("fingerprint"))
+        {
+            os_sig os;
+            QDomElement elem = temp;
+            /* Getting attributes (name/class) of OS fingerprint */
+            os.os_name = elem.attribute("os_name");
+            os.os_class = elem.attribute("os_class");
+
+            /* Getting signature of current OS fingerprint */
+            elem = elem.firstChildElement(); // tcp_test
+            QDomElement sig = elem.firstChildElement("SA");
+            os.sa_params = sig.attribute("tcpsig");
+            sig = elem.firstChildElement("S");
+            os.s_params = sig.attribute("tcpsig");
+
+            os_list.push_back(os);
+            //            qDebug() << os.os_name << " " <<  os.os_class;
+            //            qDebug() << "\t" << os.s_params << " " <<  os.sa_params;
+        }
+    }
+
+    /* Set OS names (class) to GUI */
+    QStringList temp_os_name;
+    foreach (os_sig os, os_list)
+        temp_os_name.push_back(os.os_name + " (" + os.os_class + ")");
+    ui->cb_os_type->clear();
+    ui->cb_os_type->addItems(temp_os_name);
+
 }
 
-void mw::click_ip_dst()
+void mw::change_tab(int current_tab)
 {
-    if (ui->cb_ip_dst->isChecked()) {
+    //    QMessageBox::critical(NULL, "Title", QString::number(current_tab));
+    if (current_tab == 1) {
+        old_height = ui->tabWidget->height();
+        resize(width(), height() + delta - old_height);
+        ui->tabWidget->resize(ui->tabWidget->width(), delta);
+        //        ui->label_2->move(ui->label_2->x(), ui->label_2->y() + delta);
+        //        ui->label_3->move(ui->label_3->x(), ui->label_3->y() + delta);
+        //        ui->label_6->move(ui->label_6->x(), ui->label_6->y() + delta);
+        //        ui->label_7->move(ui->label_7->x(), ui->label_7->y() + delta);
 
-        
-        ui->sp_ip_dst_new_1->setEnabled(true);
-        ui->sp_ip_dst_new_2->setEnabled(true);
-        ui->sp_ip_dst_new_3->setEnabled(true);
-        ui->sp_ip_dst_new_4->setEnabled(true);
-        
-        ui->sp_ip_dst_old_1->setEnabled(true);
-        ui->sp_ip_dst_old_2->setEnabled(true);
-        ui->sp_ip_dst_old_3->setEnabled(true);
-        ui->sp_ip_dst_old_4->setEnabled(true);
-        
-        ui->dot_7->setEnabled(true);
-        ui->dot_8->setEnabled(true);
-        ui->dot_9->setEnabled(true);
-        ui->dot_10->setEnabled(true);
-        ui->dot_11->setEnabled(true);
-        ui->dot_12->setEnabled(true);
-    } else {
-        ui->sp_ip_dst_new_1->setEnabled(false);
-        ui->sp_ip_dst_new_2->setEnabled(false);
-        ui->sp_ip_dst_new_3->setEnabled(false);
-        ui->sp_ip_dst_new_4->setEnabled(false);
-        
-        ui->sp_ip_dst_old_1->setEnabled(false);
-        ui->sp_ip_dst_old_2->setEnabled(false);
-        ui->sp_ip_dst_old_3->setEnabled(false);
-        ui->sp_ip_dst_old_4->setEnabled(false);
-        
-        ui->dot_7->setEnabled(false);
-        ui->dot_8->setEnabled(false);
-        ui->dot_9->setEnabled(false);
-        ui->dot_10->setEnabled(false);
-        ui->dot_11->setEnabled(false);
-        ui->dot_12->setEnabled(false);
+        ui->groupBox->move(ui->groupBox->x(), ui->groupBox->y() + delta - old_height);
+        ui->groupBox_2->move(ui->groupBox_2->x(), ui->groupBox_2->y() + delta - old_height);
+        ui->pb_capture->move(ui->pb_capture->x(), ui->pb_capture->y() + delta - old_height);
+        ui->pb_exit->move(ui->pb_capture->x(), ui->pb_capture->y() + delta - old_height);
+
     }
-}
-void mw::click_ip_src()
-{
-    if (ui->cb_ip_src->isChecked()) {
-        ui->sp_ip_src_new_1->setEnabled(true);
-        ui->sp_ip_src_new_2->setEnabled(true);
-        ui->sp_ip_src_new_3->setEnabled(true);
-        ui->sp_ip_src_new_4->setEnabled(true);
-
-        ui->sp_ip_src_old_1->setEnabled(true);
-        ui->sp_ip_src_old_2->setEnabled(true);
-        ui->sp_ip_src_old_3->setEnabled(true);
-        ui->sp_ip_src_old_4->setEnabled(true);
-
-        ui->dot_1->setEnabled(true);
-        ui->dot_2->setEnabled(true);
-        ui->dot_3->setEnabled(true);
-        ui->dot_4->setEnabled(true);
-        ui->dot_5->setEnabled(true);
-        ui->dot_6->setEnabled(true);
-    } else {
-        ui->sp_ip_src_new_1->setEnabled(false);
-        ui->sp_ip_src_new_2->setEnabled(false);
-        ui->sp_ip_src_new_3->setEnabled(false);
-        ui->sp_ip_src_new_4->setEnabled(false);
-
-        ui->sp_ip_src_old_1->setEnabled(false);
-        ui->sp_ip_src_old_2->setEnabled(false);
-        ui->sp_ip_src_old_3->setEnabled(false);
-        ui->sp_ip_src_old_4->setEnabled(false);
-
-        ui->dot_1->setEnabled(false);
-        ui->dot_2->setEnabled(false);
-        ui->dot_3->setEnabled(false);
-        ui->dot_4->setEnabled(false);
-        ui->dot_5->setEnabled(false);
-        ui->dot_6->setEnabled(false);
+    else if (current_tab == 0) {
+        resize(width(), height() - delta + old_height);
+        ui->tabWidget->resize(ui->tabWidget->width(), old_height);
+        ui->groupBox->move(ui->groupBox->x(), ui->groupBox->y() - delta + old_height);
+        ui->groupBox_2->move(ui->groupBox_2->x(), ui->groupBox_2->y() - delta + old_height);
+        ui->pb_capture->move(ui->pb_capture->x(), ui->pb_capture->y() - delta + old_height);
+        ui->pb_exit->move(ui->pb_capture->x(), ui->pb_capture->y() - delta + old_height);
     }
+
 }
 
 void mw::exit_capture()
 {
-    
     ctrlc_handler(1);
+    sleep(1);
     exit(0);
-    this->close();
 }
 
 
 int mw::get_num_dev_1() { return ui->comb_adapter_1->currentIndex() + 1; }
 int mw::get_num_dev_2() { return ui->comb_adapter_2->currentIndex() + 1; }
 
-int mw::get_ttl(int num)
+
+
+std::vector<int> mw::get_ip_host()
 {
-    if (num == 1)
-        return ui->sp_ttl_old->value();
-    if (num == 2)
-        return ui->sp_ttl_old->value();
-    else
-        return -1;
+    std::vector<int> temp;
+    temp.push_back(ui->sp_ip_1->value());
+    temp.push_back(ui->sp_ip_2->value());
+    temp.push_back(ui->sp_ip_3->value());
+    temp.push_back(ui->sp_ip_4->value());
+
+    return temp;
 }
 
 
-std::vector<int> mw::get_ip_dst(int type)
+void mw::host_one()
 {
-    // old
-    if (type == 1) {
-        std::vector<int> temp;
-        temp.push_back(ui->sp_ip_dst_old_1->value());
-        temp.push_back(ui->sp_ip_dst_old_2->value());
-        temp.push_back(ui->sp_ip_dst_old_3->value());
-        temp.push_back(ui->sp_ip_dst_old_4->value());
-        qDebug() << temp;
-        return temp;
-    }
-    // new
-    if (type == 2) {
-        std::vector<int> temp;
-        temp.push_back(ui->sp_ip_dst_new_1->value());
-        temp.push_back(ui->sp_ip_dst_new_2->value());
-        temp.push_back(ui->sp_ip_dst_new_3->value());
-        temp.push_back(ui->sp_ip_dst_new_4->value());
-        qDebug() << temp;
-        return temp;
-    }
+    ui->lb_dot_1->setEnabled(true);
+    ui->lb_dot_2->setEnabled(true);
+    ui->lb_dot_3->setEnabled(true);
+
+    ui->sp_ip_1->setEnabled(true);
+    ui->sp_ip_2->setEnabled(true);
+    ui->sp_ip_3->setEnabled(true);
+    ui->sp_ip_4->setEnabled(true);
 }
 
-std::vector<int> mw::get_ip_src(int type)
+void mw::host_all()
 {
-    // old
-    if (type == 1) {
-        std::vector<int> temp;
-        temp.push_back(ui->sp_ip_src_old_1->value());
-        temp.push_back(ui->sp_ip_src_old_2->value());
-        temp.push_back(ui->sp_ip_src_old_3->value());
-        temp.push_back(ui->sp_ip_src_old_4->value());
-        qDebug() << temp;
-        return temp;
-    }
-    // new
-    if (type == 2) {
-        std::vector<int> temp;
-        temp.push_back(ui->sp_ip_src_new_1->value());
-        temp.push_back(ui->sp_ip_src_new_2->value());
-        temp.push_back(ui->sp_ip_src_new_3->value());
-        temp.push_back(ui->sp_ip_src_new_4->value());
-        qDebug() << temp;
-        return temp;
-    }
+
+    ui->lb_dot_1->setEnabled(false);
+    ui->lb_dot_2->setEnabled(false);
+    ui->lb_dot_3->setEnabled(false);
+
+    ui->sp_ip_1->setEnabled(false);
+    ui->sp_ip_2->setEnabled(false);
+    ui->sp_ip_3->setEnabled(false);
+    ui->sp_ip_4->setEnabled(false);
 }

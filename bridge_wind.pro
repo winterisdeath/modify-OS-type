@@ -1,4 +1,4 @@
-QT       += core gui
+QT       += core gui xml
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -18,17 +18,20 @@ DEFINES += QT_DEPRECATED_WARNINGS
 SOURCES += \
     bridge.cpp \
     main.cpp \
-    manual_wind.cpp \
-    mw.cpp
+    mw.cpp \
+    dialog.cpp \
+    tcp_opt.cpp
 
 HEADERS += \
-    manual_wind.h \
     mw.h \
-    packets_headers.h
+    packets_headers.h \
+    dialog.h \
+    tcp_opt.h
 
 FORMS += \
-    manual_wind.ui \
-    mw.ui
+    mw.ui \
+    dialog.ui \
+    tcp_opt.ui
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

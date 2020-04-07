@@ -2,10 +2,32 @@
 #define MW_H
 
 #include <QMainWindow>
+#include <QDir>
+#include <QDebug>
+#include <QDomDocument>
+#include <QFile>
+#include <QMessageBox>
+#include <QList>
+
+
+
+#include "tcp_opt.h"
+
+
+#include "packets_headers.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class mw; }
 QT_END_NAMESPACE
+
+
+/* Storage data structure used to pass parameters to the threads */
+struct in_out_adapter
+{
+    unsigned int state;		/* Some simple state information */
+    pcap_t *input_adapter;
+    pcap_t *output_adapter;
+};
 
 class mw : public QMainWindow
 {
@@ -15,12 +37,9 @@ class mw : public QMainWindow
 
 private:
     Ui::mw *ui;
-    bool _auto = false;
-    bool _semi = false;
-    bool _manual = false;
-    bool _ttl = false;
-    bool _ip_src = false;
-    bool _ip_dst = false;
+    tcp_opt *tcp_opt_widget = new tcp_opt;
+    int delta = tcp_opt_widget->height();
+    int old_height;
 
 public:
     mw(QWidget *parent = nullptr);
@@ -29,25 +48,23 @@ public:
     int get_num_dev_1();
     int get_num_dev_2();
 
-    bool check_auto()   { return _auto; }
-    bool check_semi()   { return _semi; }
-    bool check_manual() { return _manual; }
-    bool check_ttl()    { return  _ttl; }
-    bool check_ip_src()     { return _ip_src; }
-    bool check_ip_dst()     { return _ip_dst; }
-
-    int get_ttl(int num);
-    std::vector<int> get_ip_dst(int type);
-    std::vector<int> get_ip_src(int type);
+    std::vector<int> get_ip_host();
+    pcap_t *adhandle1, *adhandle2;
+    pcap_if_t *alldevs;
+    struct bpf_program fcode;
+    in_out_adapter couple1, couple2;
+    QList<os_sig> os_list;
 
 private slots:
-    void click_auto();
-    void click_semi();
-    void click_manual();
-    void click_ttl();
-    void click_ip_dst();
-    void click_ip_src();
-    int start_capturing();
+    void host_one();
+    void host_all();
+    int  start_capturing();
     void exit_capture();
+
+    /* SLOT for changing tab */
+    void change_tab(int current_tab);
+
+    /* SLOT for open and refresh DB view */
+    void open_fp_database();
 };
 #endif // MW_H

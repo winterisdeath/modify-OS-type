@@ -1,24 +1,18 @@
 #include <signal.h>
 #include <pcap.h>
 
+#include "mw.h"
+#include "manual_wind.h"
+
 #include <thread>
+#include <vector>
 #include <mutex>
 #include <stdlib.h>
 #include <iostream>
 #include <unistd.h>
-#include "packets_headers.h"
-#include "mw.h"
 #include <QMessageBox>
 #include <QDebug>
-#include "manual_wind.h"
 
-/* Storage data structure used to pass parameters to the threads */
-struct in_out_adapter
-{
-    unsigned int state;		/* Some simple state information */
-    pcap_t *input_adapter;
-    pcap_t *output_adapter;
-};
 
 
 /* Prototypes */
@@ -44,86 +38,63 @@ std::mutex g_mutex;
 volatile int kill_forwaders = 0;
 
 /* Print all devs */
-pcap_if_t *print_all_devs(bool debug, int &count)
-{
-    pcap_if_t *alldevsp;
-    char errbuf[PCAP_ERRBUF_SIZE];
-
-    if (pcap_findalldevs(&alldevsp, errbuf) != -1) {
-        if (debug == true)
-            for (pcap_if_t *dev = alldevsp; dev; dev = dev->next) {
-                printf("%s\n", dev->name);
-                count++;
-            }
-        return alldevsp;
-    }
-    else {
-        return NULL;
-    }
-}
+pcap_if_t *print_all_devs(bool debug, int &count);
 
 /* Get all devs */
-QStringList get_all_devs()
+QStringList get_all_devs();
+
+uchar arp_nmap[] =
 {
-    int count;
-    pcap_if_t *alldevsp = print_all_devs(false, count);
-    QStringList devs;
-    for(pcap_if_t *d = alldevsp; d; d = d->next)
-        devs.append(QString(d->name));
-    pcap_freealldevs(alldevsp);
-    //    qDebug() << devs;
-    return devs;
-}
-
-
+    0x08, 0x00, 0x27, 0x47, 0x9c, 0xbd, 0x08, 0x00, 0x27, 0xd7, 0x08, 0x5b, 0x08, 0x06, 0x00, 0x01,
+    0x08, 0x00, 0x06, 0x04, 0x00, 0x02, 0x08, 0x00, 0x27, 0xd7, 0x08, 0x5b, 0x0a, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x27, 0x47, 0x9c, 0xbd, 0x0a, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
 
 /* For modify */
 
-u_char* modify_packet(u_char*, u_int*);
-uint16_t ip_checksum(const uint16_t* buf, size_t hdr_len);
-unsigned short tcp_checksum(unsigned short *usBuf, int iSize);
+uchar* modify_packet(uchar* buffer, uint& size);
+uchar* modify_nmap(uchar* buffer, uint& size);
+ushort ip_sum(uchar *buffer);
+ushort tcp_sum(uchar *buffer, ushort tcp_len);
+void get_os_params(os_sig os, bool type_param, ushort &win_size, uchar &ttl, uchar &df_bit,
+                   std::vector<uchar> &options);
 
-const u_char Linux26x_SYN_Options[20] = { 0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x08, 0x0a, 0x8f, 0xb6, 0xc4, 0x0a, 0x00, 0x00, 0x00 ,0x00, 0x01, 0x03, 0x03, 0x01 };
-const u_char Linux26x_SYN_ACK_Options[8] = { 0x02, 0x04, 0x05, 0xb4, 0x01, 0x01, 0x04, 0x02 };
-const u_char Windows_Options[8] = { 0x02, 0x04, 0x05, 0xb4, 0x01, 0x01, 0x04, 0x02 };
-const u_char Win_TTL = 128;
-const u_char LinuxTTL = 64;
-bool SYN = false;
-int ppp = 0;
+/* Modify params */
+uchar ttl;
+/* -- SYN-ACK params -- */
+std::vector<uchar> syn_options;
+ushort syn_ack_win_size;
+uchar syn_ack_options_size;
+uchar syn_ack_df_bit;
+
+/* -- SYN params -- */
+std::vector<uchar> syn_ack_options;
+ushort syn_win_size;
+uchar syn_options_size;
+uchar syn_df_bit;
 
 
 /* For checking the mode */
-bool glob_auto;
-bool glob_semi;
-bool glob_manual;
-bool glob_ttl;
-bool glob_ip_src;
-bool glob_ip_dst;
-
-bool glob_drop = false;
+bool glob_mode;
+bool host_mode;
+os_sig os;
 
 /* For reading the parametres of semi-auto mode */
-std::vector<int> ip_src_old;
-std::vector<int> ip_src_new;
-std::vector<int> ip_dst_old;
-std::vector<int> ip_dst_new;
+std::vector<int> ip_host;
 
-int ttl_old;
-int ttl_new;
 /*******************************************************************/
 
 int mw::start_capturing()
 {
-    pcap_if_t *alldevs;
+
     pcap_if_t *dev;
     int inum1, inum2;
     int i=0;
-    pcap_t *adhandle1, *adhandle2;
     char errbuf[PCAP_ERRBUF_SIZE];
-    u_int netmask1, netmask2;
+    uint netmask1, netmask2;
     char packet_filter[256];
-    struct bpf_program fcode;
-    in_out_adapter couple1, couple2;
+
 
     /*
      * Retrieve the device list
@@ -166,123 +137,125 @@ int mw::start_capturing()
     inum1 = get_num_dev_1();
     inum2 = get_num_dev_2();
     if (inum1 == inum2) {
-        QMessageBox::critical(this, QString("Error"), QString("You should choose different adapters!"));
-        return  -1;
+        QMessageBox::critical(this, "Error", "Select different adapters!");
+        return -1;
     }
-
-    if (check_auto() == false && check_semi() == false && check_manual() == false) {
-        QMessageBox::critical(this, QString("Error"), QString("You should choose mode of capturing!"));
-        return  -1;
-    }
-
-    glob_auto = check_auto();
-    glob_semi = check_semi();
-    glob_manual = check_manual();
-    glob_ttl = check_ttl();
-    glob_ip_src = check_ip_src();
-    glob_ip_dst = check_ip_dst();
-
     /*
      * Get input from the user
+     * 0 - auto mode
+     * 1 - semi-auto mode
      */
+    glob_mode = ui->tabWidget->currentIndex();
 
-    if (glob_semi) {
-        if (glob_ttl) {
-            ttl_old = get_ttl(1);
-            ttl_new = get_ttl(2);
-        }
-        if (glob_ip_src) {
-            ip_src_old = get_ip_src(1);
-            ip_src_new = get_ip_src(2);
-        }
-        if (glob_ip_dst) {
-            ip_dst_old = get_ip_src(1);
-            ip_dst_new = get_ip_src(2);
-        }
+    /*
+     * Check protected hosts
+     * 0 - all host
+     * 1 - required host
+     */
+    if (ui->rb_host_all->isChecked()) {
+        host_mode = false;
     }
+    else {
+        host_mode = true ;
+        ip_host = get_ip_host();
+    }
+
+
+    /* Get OS num to read fingerprint */
+    int ind = ui->cb_os_type->currentIndex();
+    os = os_list.at(ind);
+
+    /* type_param
+     * 0 - S
+     * 1 - SA
+     */
+    get_os_params(os, 0, syn_win_size, ttl, syn_df_bit, syn_options);
+    get_os_params(os, 1, syn_ack_win_size, ttl, syn_ack_df_bit, syn_ack_options);
+//    qDebug() << os.s_params;
+//    qDebug() << hex << "syn:     " << syn_options;
+//    qDebug() << os.sa_params;
+//    qDebug() << hex << "syn-ack: " << syn_ack_options;
 
 
     /* cmd -> GUI */
 
     /* Get the filter*/
-    //    printf("\nSpecify filter (hit return for no filter):");
-    //    fgets(packet_filter, sizeof(packet_filter), stdin);
     packet_filter[0] = '\0';
 
 
     /*
-    // Get the first interface number
-    printf("\nEnter the number of the first interface to use (1-%d):",i);
-    //  scanf("%d", &inum1);  // OLD
-    std::cin >> inum1;
+                    // Get the first interface number
+                    printf("\nEnter the number of the first interface to use (1-%d):",i);
+                    //  scanf("%d", &inum1);  // OLD
+                    std::cin >> inum1;
 
-    if(inum1 < 1 || inum1 > i)
-    {
-        printf("\nInterface number out of range.\n");
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
+                    if(inum1 < 1 || inum1 > i)
+                    {
+                        printf("\nInterface number out of range.\n");
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
 
 
-    // Get the second interface number
-    printf("Enter the number of the second"
-           " interface to use (1-%d):",i);
-    // scanf("%d", &inum2); // OLD
-    std::cin >> inum2;
+                    // Get the second interface number
+                    printf("Enter the number of the second"
+                           " interface to use (1-%d):",i);
+                    // scanf("%d", &inum2); // OLD
+                    std::cin >> inum2;
 
-    if(inum2 < 1 || inum2 > i)
-    {
-        printf("\nInterface number out of range.\n");
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
+                    if(inum2 < 1 || inum2 > i)
+                    {
+                        printf("\nInterface number out of range.\n");
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
 
-    if(inum1 == inum2 )
-    {
-        printf("\nCannot bridge packets on the same interface.\n");
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
-*/
+                    if(inum1 == inum2 )
+                    {
+                        printf("\nCannot bridge packets on the same interface.\n");
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
+                */
 
 
     /*
-     * Open the specified couple of adapters
-     */
+                     * Open the specified couple of adapters
+                     */
 
     /* Jump to the first selected adapter */
     for(dev = alldevs, i = 0; i< inum1 - 1;  dev = dev->next, i++);
 
     /*
-     * Open the first adapter.
-     * *NOTICE* the flags we are using, they are important for the behavior of the prgram:
-     *	- PCAP_OPENFLAG_PROMISCUOUS: tells the adapter to go in promiscuous mode.
-     *    This means that we are capturing all the traffic, not only the one to or from
-     *    this machine.
-     *	- PCAP_OPENFLAG_NOCAPTURE_LOCAL: prevents the adapter from capturing again the packets
-     *	  transmitted by itself. This avoids annoying loops.
-     *	- PCAP_OPENFLAG_MAX_RESPONSIVENESS: configures the adapter to provide minimum latency,
-     *	  at the cost of higher CPU usage.
-     */
+                     * Open the first adapter.
+                     * *NOTICE* the flags we are using, they are important for the behavior of the prgram:
+                     *	- PCAP_OPENFLAG_PROMISCUOUS: tells the adapter to go in promiscuous mode.
+                     *    This means that we are capturing all the traffic, not only the one to or from
+                     *    this machine.
+                     *	- PCAP_OPENFLAG_NOCAPTURE_LOCAL: prevents the adapter from capturing again the packets
+                     *	  transmitted by itself. This avoids annoying loops.
+                     *	- PCAP_OPENFLAG_MAX_RESPONSIVENESS: configures the adapter to provide minimum latency,
+                     *	  at the cost of higher CPU usage.
+                     */
 
     /* === WINDOWS === */
     /*
-     if((adhandle1 = pcap_open(d->name,						    // name of the device
-                              65536,							// portion of the packet to capture.
-                              // 65536 grants that the whole packet will be captured on every link layer.
-                              PCAP_OPENFLAG_PROMISCUOUS |	// flags. We specify that we don't want to capture loopback packets, and that the driver should deliver us the packets as fast as possible
-                              PCAP_OPENFLAG_NOCAPTURE_LOCAL |
-                              PCAP_OPENFLAG_MAX_RESPONSIVENESS,
-                              500,							// read timeout
-                              NULL,							// remote authentication
-                              errbuf							// error buffer
-                              )) == NULL)
-    {
-        fprintf(stderr,"\nUnable to open the adapter. %s is not supported by WinPcap\n", d->description);
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
-    */
+                     if((adhandle1 = pcap_open(d->name,						    // name of the device
+                                              65536,							// portion of the packet to capture.
+                                              // 65536 grants that the whole packet will be captured on every link layer.
+                                              PCAP_OPENFLAG_PROMISCUOUS |	// flags. We specify that we don't want to capture loopback packets, and that the driver should deliver us the packets as fast as possible
+                                              PCAP_OPENFLAG_NOCAPTURE_LOCAL |
+                                              PCAP_OPENFLAG_MAX_RESPONSIVENESS,
+                                              500,							// read timeout
+                                              NULL,							// remote authentication
+                                              errbuf							// error buffer
+                                              )) == NULL)
+                    {
+                        fprintf(stderr,"\nUnable to open the adapter. %s is not supported by WinPcap\n", d->description);
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
+                    */
     adhandle1 = pcap_open_live(dev->name, BUFSIZ, 1, 1000, errbuf);
     if (adhandle1 == NULL) {
         fprintf(stderr, "Couldn't open device %s: %s\n", dev->name, errbuf);
@@ -297,7 +270,7 @@ int mw::start_capturing()
         /* Retrieve the mask of the first address of the interface */
         //  netmask1 = ((struct sockaddr_in *)(dev->addresses->netmask))->sin_addr.S_un.S_addr;
         //        netmask1 = ((struct sockaddr_in *)(dev->addresses->netmask))->sin_addr.s_addr;
-        netmask1 = 0xffffff80;
+        netmask1 = 0xffffff00;
     }
     else
     {
@@ -311,22 +284,22 @@ int mw::start_capturing()
     /* === WINDOWS === */
     /* Open the second adapter */
     /*
-    if((adhandle2 = pcap_open(d->name,						// name of the device
-                              65536,							// portion of the packet to capture.
-                              // 65536 grants that the whole packet will be captured on every link layer.
-                              PCAP_OPENFLAG_PROMISCUOUS |	// flags. We specify that we don't want to capture loopback packets, and that the driver should deliver us the packets as fast as possible
-                              PCAP_OPENFLAG_NOCAPTURE_LOCAL |
-                              PCAP_OPENFLAG_MAX_RESPONSIVENESS,
-                              500,							// read timeout
-                              NULL,							// remote authentication
-                              errbuf							// error buffer
-                              )) == NULL)
-    {
-        fprintf(stderr,"\nUnable to open the adapter. %s is not supported by WinPcap\n", d->description);
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
-    */
+                    if((adhandle2 = pcap_open(d->name,						// name of the device
+                                              65536,							// portion of the packet to capture.
+                                              // 65536 grants that the whole packet will be captured on every link layer.
+                                              PCAP_OPENFLAG_PROMISCUOUS |	// flags. We specify that we don't want to capture loopback packets, and that the driver should deliver us the packets as fast as possible
+                                              PCAP_OPENFLAG_NOCAPTURE_LOCAL |
+                                              PCAP_OPENFLAG_MAX_RESPONSIVENESS,
+                                              500,							// read timeout
+                                              NULL,							// remote authentication
+                                              errbuf							// error buffer
+                                              )) == NULL)
+                    {
+                        fprintf(stderr,"\nUnable to open the adapter. %s is not supported by WinPcap\n", d->description);
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
+                    */
     adhandle2 = pcap_open_live(dev->name, BUFSIZ, 1, 1000, errbuf);
     if (adhandle1 == NULL) {
         fprintf(stderr, "Couldn't open device %s: %s\n", dev->name, errbuf);
@@ -339,7 +312,7 @@ int mw::start_capturing()
         /* Retrieve the mask of the first address of the interface */
         //  netmask2 = ((struct sockaddr_in *)(dev->addresses->netmask))->sin_addr.S_un.S_addr;
         //        netmask2 = ((struct sockaddr_in *)(dev->addresses->netmask))->sin_addr.s_addr;
-        netmask2 = 0xffffff80;
+        netmask2 = 0xffffff00;
     }
     else
     {
@@ -349,8 +322,8 @@ int mw::start_capturing()
 
 
     /*
-     * Compile and set the filters
-     */
+                     * Compile and set the filters
+                     */
 
     /* compile the filter for the first adapter */
     if (pcap_compile(adhandle1, &fcode, packet_filter, 1, netmask1) <0 )
@@ -412,8 +385,8 @@ int mw::start_capturing()
     pcap_freealldevs(alldevs);
 
     /*
-     * Start the threads that will forward the packets
-     */
+                     * Start the threads that will forward the packets
+                     */
 
     /* === WINDOWS === */
     /* Initialize the critical section that will be used by the threads for console output */
@@ -431,26 +404,26 @@ int mw::start_capturing()
 
     /* === WINDOWS === */
     /*
-    if((threads[0] = CreateThread(
-            NULL,
-            0,
-            CaptureAndForwardThread,
-            &couple0,
-            0,
-            NULL)) == NULL)
-    {
-        fprintf(stderr, "error creating the first forward thread");
+                    if((threads[0] = CreateThread(
+                            NULL,
+                            0,
+                            CaptureAndForwardThread,
+                            &couple0,
+                            0,
+                            NULL)) == NULL)
+                    {
+                        fprintf(stderr, "error creating the first forward thread");
 
-        // Close the adapters
-        pcap_close(adhandle1);
-        pcap_close(adhandle2);
+                        // Close the adapters
+                        pcap_close(adhandle1);
+                        pcap_close(adhandle2);
 
-        pcap_freealldevs(alldevs);  // Free the device list
-        return -1;
-    }
-    */
+                        pcap_freealldevs(alldevs);  // Free the device list
+                        return -1;
+                    }
+                    */
 
-    //    std::cout << "Opening first thread..." << std::endl;
+    //    std::qDebug()<< "Opening first thread..." << std::endl;
     qDebug() << "Opening first thread...";
     std::thread thr_one(capture_forward_thread, std::ref(couple1));
     //    std::thread thr_one(capture_forward_thread, couple1);
@@ -459,91 +432,95 @@ int mw::start_capturing()
     /* === WINDOWS === */
     /* Start second thread */
     /*
-    if((threads[1] = CreateThread(
-            NULL,
-            0,
-            CaptureAndForwardThread,
-            &couple1,
-            0,
-            NULL)) == NULL)
-    {
-        fprintf(stderr, "error creating the second forward thread");
+                    if((threads[1] = CreateThread(
+                            NULL,
+                            0,
+                            CaptureAndForwardThread,
+                            &couple1,
+                            0,
+                            NULL)) == NULL)
+                    {
+                        fprintf(stderr, "error creating the second forward thread");
 
-        // Kill the first thread. Not very gentle at all...
-        TerminateThread(threads[0], 0);
+                        // Kill the first thread. Not very gentle at all...
+                        TerminateThread(threads[0], 0);
 
-        // Close the adapters
-        pcap_close(adhandle1);
-        pcap_close(adhandle2);
+                        // Close the adapters
+                        pcap_close(adhandle1);
+                        pcap_close(adhandle2);
 
-        pcap_freealldevs(alldevs); // Free the device list
-        return -1;
-    }
-    */
+                        pcap_freealldevs(alldevs); // Free the device list
+                        return -1;
+                    }
+                    */
 
-    //    std::cout << "Opening second thread..." << std::endl;
+    //    std::qDebug()<< "Opening second thread..." << std::endl;
     qDebug() << "Opening second thread...";
     std::thread thr_two(capture_forward_thread, std::ref(couple2));
     //    std::thread thr_two(capture_forward_thread, couple2);
 
-    thr_one.join();
-    thr_two.join();
+    thr_one.detach();
+    thr_two.detach();
+    //    thr_one.join();
+    //    thr_two.join();
 
 
 
-    /*
-     * Install a CTRL+C handler that will do the cleanups on exit
-     */
-    signal(SIGINT, ctrlc_handler);
 
     /*
-     * Done!
-     * Wait for the Greek calends...
-     */
-    printf("\nStart bridging the two adapters...\n");
+                     * Install a CTRL+C handler that will do the cleanups on exit
+                     */
+    //    signal(SIGINT, ctrlc_handler);
+
+    /*
+                     * Done!
+                     * Wait for the Greek calends...
+                     */
+    //    printf("\nStart bridging the two adapters...\n");
 
     /* === WINDOWS === */
     //    sleep(INFINITE);
-    sleep(800000);
-    pcap_close(adhandle1);
-    pcap_close(adhandle2);
-    pcap_freealldevs(alldevs);
 
+    /*sleep(800000);
+                    pcap_close(adhandle1);
+                    pcap_close(adhandle2);
+                    pcap_freealldevs(alldevs);
+                    */
     return 0;
 }
 
 /*******************************************************************
- * Forwarding thread.
- * Gets the packets from the input adapter and sends them to the output one.
- *******************************************************************/
+                 * Forwarding thread.
+                 * Gets the packets from the input adapter and sends them to the output one.
+                 *******************************************************************/
 
 /* === WINDOWS === */
 // DWORD WINAPI CaptureAndForwardThread(LPVOID lpParameter)
 int capture_forward_thread(in_out_adapter& adapter)
 {
     static int c = 0;
-    std::cout << "In " << c << " thread!" << std::endl;
+    qDebug()<< "In " << c << " thread!";
     c++;
     struct pcap_pkthdr *header;
-    const u_char *pkt_data;
+    const uchar *pkt_data;
     int res = 0;
     in_out_adapter* ad_couple = &adapter;
     unsigned int n_fwd = 0;
 
     /*
-     * Loop receiving packets from the first input adapter
-     */
+                     * Loop receiving packets from the first input adapter
+                     */
 
     while((!kill_forwaders) && (res = pcap_next_ex(ad_couple->input_adapter, &header, &pkt_data)) >= 0)
     {
         if(res != 0)	/* Note: res=0 means "read timeout elapsed"*/
         {
             /*
-             * Print something, just to show when we have activity.
-             * BEWARE: acquiring a critical section and printing strings with printf
-             * is something inefficient that you seriously want to avoid in your packet loop!
-             * However, since this is a *sample program*, we privilege visual output to efficiency.
-             */
+                             * Print something, just to show when we have activity.
+                             * BEWARE: acquiring a critical section and printing strings with printf
+                             * is something inefficient that you seriously want to avoid in your packet loop!
+                             * However, since this is a *sample program*, we privilege visual output to efficiency.
+                             */
 
             /* === WINDOWS === */
             /* EnterCriticalSection(&print_cs); */
@@ -551,55 +528,68 @@ int capture_forward_thread(in_out_adapter& adapter)
 
             if(ad_couple->state == 1) {
                 /*======================= ЗДЕСЬ ИЗМЕНЯТЬ ПАКЕТЫ! =======================*/
-                u_char* new_pkt = modify_packet((u_char*)pkt_data, &header->caplen);
+                /* Protect required IP */
+                if (host_mode == true) {
+                    if ((pkt_data[0x0c] == 0x08) && (pkt_data[0x0d] == 0x00))
+                        if (pkt_data[0x1a] == ip_host[0] && pkt_data[0x1b] == ip_host[1]
+                                && pkt_data[0x1c] == ip_host[2] && pkt_data[0x1d] == ip_host[3]) {
 
-                
-                pkt_data = new_pkt;
+                            //                            qDebug() << "Modify one host!";
+                            uchar* new_pkt = modify_packet((uchar*)pkt_data, header->caplen);
+                            pkt_data = new_pkt;
+                        }
+                }
+                else {
+                    //                    qDebug() << "Modify all!";
+                    uchar* new_pkt = modify_packet((uchar*)pkt_data, header->caplen);
+                    pkt_data = new_pkt;
+                }
+
 
                 /* ============================== */
 
-                printf(">> Len: %u\n", header->caplen);
-                printf("   Data: %s\n", pkt_data);
+                qDebug() << ">> Len: " << header->caplen;
             }
             else {
                 printf("<< Len: %u\n", header->caplen);
             }
+
             /* === WINDOWS === */
             /* LeaveCriticalSection(&print_cs); */
             g_mutex.unlock();
 
             /*
-             * Send the just received packet to the output adaper
-             */
-            if (glob_drop == false) {
-                if(pcap_sendpacket(ad_couple->output_adapter, pkt_data, header->caplen) != 0)
-                {
-                    /* === WINDOWS === */
-                    /* EnterCriticalSection(&print_cs); */
-                    g_mutex.lock();
+                                     * Send the just received packet to the output adaper
+                                     */
+            if(pcap_sendpacket(ad_couple->output_adapter, pkt_data, header->caplen) != 0)
+            {
+                /* === WINDOWS === */
+                /* EnterCriticalSection(&print_cs); */
+                g_mutex.lock();
 
-                    printf("Error sending a %u bytes packets on interface %u: %s\n",
-                           header->caplen,
-                           ad_couple->state,
-                           pcap_geterr(ad_couple->output_adapter));
+                QString msg = "Error sending a ";
+                msg += QString::number(header->caplen) + " bytes packets on interface " + QString::number(ad_couple->state);
+                msg += "\nError: ";
+                msg += pcap_geterr(ad_couple->output_adapter);
+                QMessageBox::critical(nullptr, "Error Capturing!", msg);
 
-                    /* === WINDOWS === */
-                    /* LeaveCriticalSection(&print_cs); */
-                    g_mutex.unlock();
-                }
-                else
-                {
-                    n_fwd++;
-                }
+
+                /* === WINDOWS === */
+                /* LeaveCriticalSection(&print_cs); */
+                g_mutex.unlock();
             }
             else
-                glob_drop = false;
+            {
+                n_fwd++;
+            }
+
+
         }
     }
 
     /*
-     * We're out of the main loop. Check the reason.
-     */
+                                             * We're out of the main loop. Check the reason.
+                                             */
     if(res < 0)
     {
         /* === WINDOWS === */
@@ -607,8 +597,7 @@ int capture_forward_thread(in_out_adapter& adapter)
         g_mutex.lock();
 
 
-        printf("Error capturing the packets: %s\n", pcap_geterr(ad_couple->input_adapter));
-        fflush(stdout);
+        qDebug() << "Error capturing the packets: " << pcap_geterr(ad_couple->input_adapter);
 
         /* === WINDOWS === */
         /* LeaveCriticalSection(&print_cs); */
@@ -620,10 +609,8 @@ int capture_forward_thread(in_out_adapter& adapter)
         /* EnterCriticalSection(&print_cs); */
         g_mutex.lock();
 
-        printf("End of bridging on interface %u. Forwarded packets:%u\n",
-               ad_couple->state,
-               n_fwd);
-        fflush(stdout);
+        qDebug() << "End of bridging on interface: " << ad_couple->state;
+        qDebug() << "\tForwarded packets: " << n_fwd;
 
         /* === WINDOWS === */
         /* LeaveCriticalSection(&print_cs); */
@@ -634,308 +621,341 @@ int capture_forward_thread(in_out_adapter& adapter)
 }
 
 /*******************************************************************
- * CTRL+C hanlder.
- * We order the threads to die and then we patiently wait for their
- * suicide.
- *******************************************************************/
+                                         * CTRL+C hanlder.
+                                         * We order the threads to die and then we patiently wait for their
+                                         * suicide.
+                                         *******************************************************************/
 void ctrlc_handler(int sig)
 {
     /*
-     * unused variable
-     */
+                                             * unused variable
+                                             */
     (void)(sig);
-
+    qDebug() << "Exit!";
     kill_forwaders = 1;
-    sleep(2000);
+    //    sleep(2000);
 
     //    WaitForMultipleObjects(2,
     //                           threads,
     //                           TRUE,		/* Wait for all the handles */
     //                           5000);		/* Timeout */
-//    exit(0);
+    //    exit(0);
+
 }
 
-
-u_char* modify_packet(u_char* Buffer, u_int *Size)
+uchar* modify_packet(uchar* buffer, uint &size)
 {
-    /* My changing */
+    /* Check that packet has IP */
+    if (buffer[0x0c] == 0x08 && buffer[0x0d] == 0x00) {
+        ushort ip_size = (uint)((buffer[0x10] << 8) & 0xff00 ) | (buffer[0x11] & 0x00ff);
 
-    /* auto mode */
-    if (glob_auto)
-        if (Buffer[12] == 0x08 && Buffer[13] == 0x00) {
-            qDebug()<< "old buf: " << (int)Buffer[22];
-            Buffer[22] = 64; /* Linux ttl */
-            qDebug()  << "\new: " << (int)Buffer[22] << "\n";
-            return Buffer;
-        }
+        /* -- HERE CHANGE IP parametres! -- */
+        uchar start_ip = 0x0e;
+        uchar *ip_header = buffer + start_ip; // START of IP HEADER in packet
 
-    /* semi mode */
-    if (glob_semi) {
-        if (glob_ttl)
-            if (Buffer[12] == 0x08 && Buffer[13] == 0x00)
-                if (ttl_old == 0 || ttl_old == Buffer[22]) {
-                    qDebug()<< "old buf: " << (int)Buffer[22];
-                    Buffer[22] = ttl_new;
-                    qDebug()  << "\new: " << (int)Buffer[22] << "\n";
+        /* -- DF bit -- */
+        /* This param depends on TCP flags,
+           so it will change in tcp too, but now it is set
+         */
+        ip_header[6] = ((ip_header[6]) & 0b10111111) | 0b01000000; // set
+
+        /* -- TTL -- */
+        ip_header[8] = ttl; /* Linux ttl */
+
+        /* -- IP checksum -- */
+        /* This param will re-count after TCP check,
+                                                 * because IP DF-bit maybe will changed there
+                                                 */
+
+        /* Check next protocol */
+        /* -- TCP -- */
+        if (buffer[0x17] == 0x06)
+        {
+            ushort tcp_len = ip_size - (buffer[0x0e]  & 0b00001111) * 4;
+            //            qDebug()<< "tcp: " << tcp_len;
+            ushort pseudo_len = tcp_len + 12;
+            //            qDebug()<< "pseudo: " << pseudo_len;
+
+            /* -- HERE CHANGE TCP parametres! -- */
+            uchar start_tcp = 0x22;  // START of TCP HEADER in packet
+            uchar* tcp_header = buffer + start_tcp;
+
+            /* -- Window size -- */
+            /* This param also depends on TCP Options,
+                                                     * so it will changed later
+                                                     */
+
+            /* Get header tcp size (4 bits * 4 bytes)*/
+            uchar tcp_hdr_size = ((tcp_header[0x0c] >> 4) & 0x0f) * 4;
+            //            qDebug()<< "hdr_size: " << dec << (uint)tcp_hdr_size << hex;
+
+            ushort tcp_flags = ((tcp_header[0x0c] << 8) & 0xff00)
+                    | (tcp_header[0x0d] & 0x00ff);
+
+            //            qDebug()<< hex << "flags: R  NCEUAPRSF\n";
+            //                           0b0000000000000001  - FIN
+            //                           0b0000000000000010  - SYN
+            //                           0b0000000000010000  - ACK
+            //                           0b0000000000010001  - SYN,ACK
+
+            //            qDebug() << "       " << QString::number(tcp_flags, 2);
+
+            /* Check if there are any TCP-OPTIONS */
+            if (tcp_hdr_size > 20) {
+                /* -- modify OPTIONS -- */
+
+                uchar tcp_options_size = tcp_hdr_size - 20;
+                /* NOTE! max len of options - 20 bytes */
+
+                uchar new_options_size;
+                /* check SYN flag */
+                /* ------------- LEN |R  NCEUAPRSF ---- */
+                if ((tcp_flags & 0b0000000000000010) == 0b0000000000000010) {
+//                if (false) {
+                    qDebug()<< "SYN!";
+                    /* -- Recheck IP DF-bit -- */
+                    if (syn_df_bit)
+                        ip_header[6] = ((ip_header[6]) & 0b10111111) | 0b01000000;
+                    else
+                        ip_header[6] = ((ip_header[6]) & 0b10111111);
+
+                    /* -- Window size -- */
+                    tcp_header[0x0e] = (syn_win_size >> 8) & 0x00ff;
+                    tcp_header[0x0f] = syn_win_size & 0x00ff;
+
+                    /* -- TCP Options change -- */
+                    new_options_size = syn_options.size();
+                    memcpy(tcp_header + 20, &syn_options[0], new_options_size);
                 }
-        if (glob_ip_src)
-            if ((Buffer[26] == ip_src_old[0] && Buffer[27] == ip_src_old[1]
-                 && Buffer[28] == ip_src_old[2] && Buffer[29] == ip_src_old[3])
-                    || (ip_src_old[0] == 0 && ip_src_old[1] == 0 && ip_src_old[2] == 0 && ip_src_old[3] == 0)) {
-                qDebug()<< "old ip src: " << (int)Buffer[26] << "." << (int)Buffer[27] << "."
-                        << (int)Buffer[28] << "." << (int)Buffer[29];
-                Buffer[26] = ip_src_new[0];
-                Buffer[27] = ip_src_new[1];
-                Buffer[28] = ip_src_new[2];
-                Buffer[29] = ip_src_new[3];
-                qDebug()  << "\new: " << (int)Buffer[26] << "." << (int)Buffer[27] << "."
-                          << (int)Buffer[28] << "." << (int)Buffer[29];
+
+                /* check SYN,ACK flag */
+                if ((tcp_flags & 0b0000000000010010) == 0b0000000000010010) {
+//                if (false) {
+                    qDebug()<< "SYN-ACK!";
+                    /* -- Recheck IP DF-bit -- */
+                    if (syn_ack_df_bit)
+                        ip_header[6] = ((ip_header[6]) & 0b10111111) | 0b01000000;
+                    else
+                        ip_header[6] = ((ip_header[6]) & 0b10111111);
+
+                    /* -- Window size -- */
+                    tcp_header[0x0e] = (syn_ack_win_size >> 8) & 0x00ff;
+                    tcp_header[0x0f] = syn_ack_win_size & 0x00ff;
+
+                    /* -- TCP Options change -- */
+                    new_options_size = syn_ack_options.size();
+                    memcpy(tcp_header + 20, &syn_ack_options[0], new_options_size);
+                }
+                qDebug()<< "new opt size: " << (uint)new_options_size;
+                size = ip_size + 14 - (tcp_options_size) + new_options_size;
+
+                /* Change TCP size */
+
+                short delta = new_options_size -  tcp_options_size;
+                tcp_hdr_size += (char)delta;
+                tcp_hdr_size /= 4;
+                if (tcp_hdr_size < 0x0f) {
+                    buffer[0x2e] = buffer[0x2e] & 0x0f;
+                    buffer[0x2e] = buffer[0x2e] | ((tcp_hdr_size << 4) & 0xf0);
+                }
+
+                /* Change IP size */
+                ip_size += new_options_size -  tcp_options_size;
+                buffer[0x10] = ip_size & 0xff00;
+                buffer[0x11] = ip_size & 0x00ff;
+
             }
-        if (glob_ip_dst)
-            if ((Buffer[30] == ip_dst_old[0] && Buffer[31] == ip_dst_old[1]
-                 && Buffer[32] == ip_dst_old[2] && Buffer[33] == ip_dst_old[3])
-                    || (ip_dst_old[0] == 0 && ip_dst_old[1] == 0 && ip_dst_old[2] == 0 && ip_dst_old[3] == 0)) {
-                qDebug()<< "old ip dst: " << (int)Buffer[30] << "." << (int)Buffer[31] << "."
-                        << (int)Buffer[32] << "." << (int)Buffer[33];
-                Buffer[26] = ip_dst_new[0];
-                Buffer[27] = ip_dst_new[1];
-                Buffer[28] = ip_dst_new[2];
-                Buffer[29] = ip_dst_new[3];
-                qDebug()<< "old ip dst: " << (int)Buffer[30] << "." << (int)Buffer[31] << "."
-                        << (int)Buffer[32] << "." << (int)Buffer[33];
-            }
-        return Buffer;
-    }
 
-    if (glob_manual) {
-        manual_wind *wind = new manual_wind(Buffer, Size);
-        wind->show();
-        while(wind->end_modify == false && wind->drop == false) {
-            continue;
+
+            /* TCP checksum */
+            ushort sum = tcp_sum(buffer, ip_size - (buffer[0x0e]  & 0b00001111) * 4);
+            buffer[0x32] = (uchar)((sum & 0xff00) >> 8);
+            buffer[0x33] = (uchar) (sum & 0x00ff);
+
+            /* -- TCP end -- */
         }
-
-
-        if (wind->end_modify == true) {
-
-            //            u_char *packet = new u_char[200];
-            u_int size = 0;
-            //            unsigned int *new_size;
-            wind->get_packet(Buffer, size);
-
-            qDebug() << "end " ;
-            Size = &size;
-
-            qDebug() << "new_s: " << (*Size);
-            for (unsigned i = 0; i < *Size; i++)
-                qDebug() << hex <<  Buffer[i];
-        }
-
-        if (wind->drop == true) {
-            Buffer = 0;
-            Size = 0;
-            glob_drop = true;
-            return 0;
-
-        }
-        wind->close();
-        return Buffer;
-    }
-
-
-
-
-    /* ===================== */
-
-    /* ==== Semchenkov code ==== */
-    if ((Buffer[13] == 0x00) && (Buffer[23] == 0x06))
-    {
-        unsigned char tmp_hdr_ip[20];
-        unsigned short tmpIP[10];
-
-        memcpy(tmp_hdr_ip, Buffer + 14, 20);
-
-        //#################### ����������� TCP-��������� #############################
-
-
-        unsigned short ip_len = (tmp_hdr_ip[2] << 8) | tmp_hdr_ip[3];  // ����� IP-������ (�����, � TCP-���������)
-        unsigned short tcp_size = ip_len - 20;  //  ������ TCP-�������� (TCP Header + TCP Data)
-        unsigned short tcp_len = 0;
-        if (ip_len % 2 == 1)
-        {
-            tcp_len = ip_len - 7;
-        }  // ���� ����� ��������, �� ����������� �� 1
         else
-        {
-            tcp_len = ip_len - 8; // ����� TCP-�������� + ���������������
-        }
-        unsigned short *tmpTCP = new unsigned short[750]; // ����� 16-������ (�� 2 �����) ������� - ������������ �����������
+            /* -- ICMP -- */
+            if (buffer[0x17]  == 0x01) {
 
-        unsigned char *tmp_tcp = new unsigned char[1500];	// ����� ��� �������� TCP-�������� ��� ����������� (����������������� � tmpTCP ��� �������� � ������� tcp_checksum).
+                /* -- ICMP  end -- */
+            }
 
-        //##################### ������������ ��������������� ##########################
+        /* -- IP checksum -- */
+        /* This param will re-count after TCP check,
+         * because IP DF-bit maybe will changed there
+         */
 
-        memcpy(tmp_tcp, Buffer + 26, 8);  // ���������� ��� ���������������
-        tmp_tcp[8] = 0;
-        tmp_tcp[9] = 6;
-        tmp_tcp[10] = (unsigned char)(tcp_size >> 8);
-        tmp_tcp[11] = (unsigned char)(tcp_size);
-
-        // ################### ��������� ������������ ��������������� ####################
-
-        memcpy(tmp_tcp + 12, Buffer + 34, tcp_size);
-
-        //  #####################################  ���� ��������� ����� - � ������ SYN ####################################
-
-        if (tmp_tcp[25] == 2) // TCP � ������������� ������ SYN
-        {
-
-            tmp_hdr_ip[2] = 0x00;
-            // ����������� ���� IP Total Length
-            tmp_hdr_ip[3] = 0x3c;
-
-            ip_len = 60;
-
-            tmp_tcp[24] = 0xa0;    // ����������� ���� TCP Header Length
-
-            memcpy(tmp_tcp + 32, Linux26x_SYN_Options, 20);	 // ��������� ���� Options
-
-            tcp_len = 52;   // ��������� ����� TCP-��������� � ���������������� (��� ������� tcp_checksum)
-
-            tcp_size = 40;  // ��������� ����� TCP-���������
-
-            tmp_tcp[10] = (unsigned char)(tcp_size >> 8);
-            tmp_tcp[11] = (unsigned char)(tcp_size);
-
-        }
-
-        //  #####################################  ��������� ����������� SYN-������  #########################################
-
-
-
-        //  #####################################  ���� ��������� ����� - � ������ SYN,ACK ####################################
-
-        if (tmp_tcp[25] == 18) // TCP � ������������� ������ SYN,ACK
-        {
-
-            tmp_hdr_ip[2] = 0x00;
-            // ����������� ���� IP Total Length
-            tmp_hdr_ip[3] = 0x30;
-
-            ip_len = 48;
-
-            tmp_tcp[24] = 0x70;    // ����������� ���� TCP Header Length
-
-            memcpy(tmp_tcp + 32, Linux26x_SYN_ACK_Options, 8);	 // ��������� ���� Options
-
-            tcp_len = 40;   // ��������� ����� TCP-��������� � ���������������� (��� ������� tcp_checksum)
-
-            tcp_size = 28;  // ��������� ����� TCP-���������
-
-            tmp_tcp[10] = (unsigned char)(tcp_size >> 8);
-            tmp_tcp[11] = (unsigned char)(tcp_size);
-
-        }
-
-        //  #####################################  ��������� ����������� SYN,ACK-������  #########################################
-
-
-        tmp_tcp[28] = 0;
-        //    ��������� ����������� �����
-        tmp_tcp[29] = 0;
-
-        tmp_tcp[26] = 0x16;
-        //	����������� ���� Windows Size
-        tmp_tcp[27] = 0xD0;
-
-
-
-        for (int j = 0; j < tcp_len / 2; j++)
-        {
-            tmpTCP[j] = ((tmp_tcp[j * 2] << 8) & 0xFF00) | (tmp_tcp[j * 2 + 1] & 0xFF);
-        }
-        if (tcp_size % 2 == 1) tmpTCP[tcp_len / 2 - 1] = (tmpTCP[tcp_len / 2 - 1] & 0xFF00);
-
-        unsigned short chk_sumTCP = tcp_checksum(tmpTCP, tcp_len);
-        tmp_tcp[28] = (unsigned char)(chk_sumTCP >> 8);
-        tmp_tcp[29] = (unsigned char)chk_sumTCP;
-
-        memcpy(Buffer + 34, tmp_tcp + 12, tcp_size);
-
-
-
-        //################## ��������� ����������� TCP-��������� ###############################
-
-
-        //################## ����������� IP-��������� #################################
-
-        tmp_hdr_ip[1] = 0x10;  // ����������� ���� Type Of Service (Differentiated Services Field)
-        tmp_hdr_ip[6] = 0x00;  // ����������� ���� Flags (Don't Fragment bit)
-
-        if (tmp_hdr_ip[8] - 60 < 10) tmp_hdr_ip[8] = 64;
-        tmp_hdr_ip[8] = LinuxTTL;  // ����������� TTL
-
-        tmp_hdr_ip[10] = 0;
-        // ��������� ����������� �����
-        tmp_hdr_ip[11] = 0;
-
-        for (int i = 0; i < 10; i++)
-        {
-            tmpIP[i] = ((tmp_hdr_ip[i * 2] << 8) & 0xFF00) | (tmp_hdr_ip[i * 2 + 1] & 0xFF);
-        }
-        unsigned short chk_sumIP = ip_checksum(tmpIP, 20);
-        tmp_hdr_ip[10] = (unsigned char)(chk_sumIP >> 8);
-        tmp_hdr_ip[11] = (unsigned char)chk_sumIP;
-
-        memcpy(Buffer + 14, tmp_hdr_ip, 20);
-
-        *Size = ip_len + 14;
-
-        delete[]tmpTCP;
-        delete[]tmp_tcp;
-
-        return Buffer;
+        unsigned short sum;
+        sum = ip_sum(buffer);
+        buffer[24] = (unsigned char)((sum & 0xff00) >> 8);
+        buffer[25] = (unsigned char) (sum & 0x00ff);
+        /* -- IP end -- */
     }
-    else
-    {
-
-        return Buffer;
-    }
+    return buffer;
 }
 
-uint16_t ip_checksum(const uint16_t* buf, size_t hdr_len)
-{
-    unsigned long sum = 0;
-    const uint16_t *ip1;
 
-    ip1 = buf;
-    while (hdr_len > 1)
-    {
-        sum += *ip1++;
-        if (sum & 0x80000000)
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        hdr_len -= 2;
-    }
+/* My checksum */
+ushort tcp_sum(uchar *buffer, ushort tcp_len)
+{
+    uint sum = 0;
+    uchar start = 0x22;  // START of TCP HEADER in packet
+    uchar* tcp_header = buffer + start;
+
+    /* -- Pseudo TCP header -- */
+    // Add source
+    sum += ((buffer[0x1a] << 8) & 0xff00) | (buffer[0x1b] & 0x00ff);
+    sum += ((buffer[0x1c] << 8) & 0xff00) | (buffer[0x1d] & 0x00ff);
+
+    // Add destination to sum
+    sum += ((buffer[0x1e] << 8) & 0xff00) | (buffer[0x1f]& 0x00ff);
+    sum += ((buffer[0x20] << 8) & 0xff00) | (buffer[0x21]& 0x00ff);
+
+    sum += 0x0006; // RESERVED + PROTOCOL
+    sum += tcp_len;
+
+    /* -- TCP + PAYLOAD -- */
+    for (ushort i = 0; i < tcp_len - 2; i += 2)
+        sum += ((tcp_header[i] << 8) & 0xff00)
+                | (tcp_header[i + 1] & 0x00ff);
+    if (tcp_len % 2 == 0)
+        sum += ((tcp_header[tcp_len - 2] << 8) & 0xff00)
+                | (tcp_header[tcp_len - 2 + 1] & 0x00ff);
+    else
+        sum += ((tcp_header[tcp_len - 2] << 8) & 0xff00);
+
+    // Simple sub the current checksum that was already add
+    sum -= ((tcp_header[16] << 8) & 0xff00)
+            | (tcp_header[17] & 0x00ff);
 
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
 
-    return(~sum);
+    return (~sum);
 }
 
-unsigned short tcp_checksum(unsigned short *usBuf, int iSize)
+ushort ip_sum (uchar * buffer)
 {
-    unsigned long usChksum = 0;
-    while (iSize > 1)
-    {
-        usChksum += *usBuf++;
-        iSize -= sizeof(unsigned short);
+    uchar start = 0x0e;
+    uchar *ip_header = buffer + start; // START of IP HEADER in packet
+    uint sum = 0;
+    uchar ip_size = (*ip_header & 0b00001111) * 4;
+    for (ushort i = 0; i < ip_size; i += 2)
+        sum += ((ip_header[i] << 8) & 0xff00)
+                | (ip_header[i + 1] & 0x00ff);
+
+    // Simple sub the current checksum that was already add
+    sum -= ((ip_header[10] << 8) & 0xff00) | (ip_header[11] & 0x00ff);
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
+
+
+void get_os_params(os_sig os, bool type_param, ushort &win_size,
+                   uchar &ttl, uchar &df_bit, std::vector<uchar> &options)
+{
+    options.clear();
+    QString temp;
+    if (type_param == 0)
+        temp = os.s_params;
+    else
+        temp = os.sa_params;
+    QStringList params = temp.split(":");
+
+    win_size = params.at(0).toUShort(nullptr, 10);
+    ttl = params.at(1).toUShort(nullptr, 10);
+    df_bit = params.at(2).toUShort(nullptr, 10);
+    ushort options_size = params.at(3).toUShort(nullptr, 10);
+
+    /* forming TCP options */
+    temp = params.at(4);
+    params = temp.split(",");
+    foreach (QString param, params) {
+        ushort val = 0;
+        if (param.length() > 1) {
+            QRegularExpression re("\\d+");
+            QRegularExpressionMatch match = re.match(param);
+            val = match.captured(0).toUShort();
+        }
+        switch (param.at(0).unicode())
+        {
+        case short('M'):
+        {
+            options.push_back(0x02);
+            options.push_back(0x04);
+            options.push_back((val >> 8) & 0x00ff);
+            options.push_back(val & 0x00ff);
+            break;
+        }
+        case short('W'):
+        {
+            options.push_back(0x03);
+            options.push_back(0x03);
+            options.push_back(val & 0x00ff);
+            break;
+        }
+        case short('T'):
+        {
+            options.push_back(0x08);
+            options.push_back(0x10);
+            options.insert(options.end(), 2, 0x00);
+            options.push_back(0xe2);
+            options.push_back(0x40);
+            options.insert(options.end(), 4, 0xff);
+            break;
+        }
+        case short('N'):
+        {
+            options.push_back(0x01);
+            break;
+        }
+        case short('E'):
+        {
+            options.push_back(0x00);
+            options.push_back(0x00);
+            break;
+        }
+        case short('S'):
+            options.push_back(0x04);
+            options.push_back(0x02);
+            break;
+        }
     }
 
-    if (iSize)
-        usChksum += *(unsigned char*)usBuf;
-
-    usChksum = (usChksum >> 16) + (usChksum & 0xffff);
-    usChksum += (usChksum >> 16);
-
-    return (unsigned short)(~usChksum);
+    if (options.size() != options_size - 40)
+        QMessageBox::critical(nullptr, "Error", "Error size options!");
 }
+
+pcap_if_t *print_all_devs(bool debug, int &count)
+{
+    pcap_if_t *alldevsp;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if (pcap_findalldevs(&alldevsp, errbuf) != -1) {
+        if (debug == true)
+            for (pcap_if_t *dev = alldevsp; dev; dev = dev->next) {
+                printf("%s\n", dev->name);
+                count++;
+            }
+        return alldevsp;
+    }
+    else {
+        return NULL;
+    }
+}
+
+QStringList get_all_devs()
+{
+    int count;
+    pcap_if_t *alldevsp = print_all_devs(false, count);
+    QStringList devs;
+    for(pcap_if_t *d = alldevsp; d; d = d->next)
+        devs.append(QString(d->name));
+    pcap_freealldevs(alldevsp);
+    //    qDebug() << devs;
+    return devs;
+}
+
