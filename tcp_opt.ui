@@ -112,7 +112,7 @@
           <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
          </property>
          <property name="maximum">
-          <number>255</number>
+          <number>65535</number>
          </property>
          <property name="singleStep">
           <number>1</number>

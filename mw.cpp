@@ -44,6 +44,7 @@ mw::mw(QWidget *parent)
     ui->tabWidget->addTab(tcp_opt_widget, "Manual");
 
 
+    this->setFixedSize(this->size());
 }
 
 mw::~mw()
@@ -120,7 +121,7 @@ void mw::change_tab(int current_tab)
     //    QMessageBox::critical(NULL, "Title", QString::number(current_tab));
     if (current_tab == 1) {
         old_height = ui->tabWidget->height();
-        resize(width(), height() + delta - old_height);
+        setFixedSize(width(), height() + delta - old_height);
         ui->tabWidget->resize(ui->tabWidget->width(), delta);
         //        ui->label_2->move(ui->label_2->x(), ui->label_2->y() + delta);
         //        ui->label_3->move(ui->label_3->x(), ui->label_3->y() + delta);
@@ -130,16 +131,16 @@ void mw::change_tab(int current_tab)
         ui->groupBox->move(ui->groupBox->x(), ui->groupBox->y() + delta - old_height);
         ui->groupBox_2->move(ui->groupBox_2->x(), ui->groupBox_2->y() + delta - old_height);
         ui->pb_capture->move(ui->pb_capture->x(), ui->pb_capture->y() + delta - old_height);
-        ui->pb_exit->move(ui->pb_capture->x(), ui->pb_capture->y() + delta - old_height);
+        ui->pb_exit->move(ui->pb_exit->x(), ui->pb_exit->y() + delta - old_height);
 
     }
     else if (current_tab == 0) {
-        resize(width(), height() - delta + old_height);
+        setFixedSize(width(), height() - delta + old_height);
         ui->tabWidget->resize(ui->tabWidget->width(), old_height);
         ui->groupBox->move(ui->groupBox->x(), ui->groupBox->y() - delta + old_height);
         ui->groupBox_2->move(ui->groupBox_2->x(), ui->groupBox_2->y() - delta + old_height);
         ui->pb_capture->move(ui->pb_capture->x(), ui->pb_capture->y() - delta + old_height);
-        ui->pb_exit->move(ui->pb_capture->x(), ui->pb_capture->y() - delta + old_height);
+        ui->pb_exit->move(ui->pb_exit->x(), ui->pb_exit->y() - delta + old_height);
     }
 
 }

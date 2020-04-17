@@ -24,7 +24,6 @@ private:
 private slots:
     void on_pb_ok_clicked();
     void on_pb_canc_clicked();
-    void test_slot();
 
 signals:
     void ret_signal(int value);

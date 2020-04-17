@@ -75,7 +75,7 @@ QString tcp_opt::gen_sig()
         list.append(temp);
     }
 
-    short size = 0;
+    short size = 40;
     foreach(QString item,  list) {
         switch(item.at(0).unicode())
         {
@@ -313,8 +313,8 @@ void tcp_opt::on_pb_save_clicked()
     qDebug() << node_start.nodeName();
 
     QDomElement node_fp = xml.createElement("fingerprint");
-    node_fp.setAttribute("os_name", sig_name);
     node_fp.setAttribute("os_class", sig_class);
+    node_fp.setAttribute("os_name", sig_name);
     node_start.appendChild(node_fp);
 
     QDomNode node_tcp = xml.createElement("tcp_test");

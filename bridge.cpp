@@ -2,7 +2,6 @@
 #include <pcap.h>
 
 #include "mw.h"
-#include "manual_wind.h"
 
 #include <thread>
 #include <vector>
@@ -43,13 +42,6 @@ pcap_if_t *print_all_devs(bool debug, int &count);
 /* Get all devs */
 QStringList get_all_devs();
 
-uchar arp_nmap[] =
-{
-    0x08, 0x00, 0x27, 0x47, 0x9c, 0xbd, 0x08, 0x00, 0x27, 0xd7, 0x08, 0x5b, 0x08, 0x06, 0x00, 0x01,
-    0x08, 0x00, 0x06, 0x04, 0x00, 0x02, 0x08, 0x00, 0x27, 0xd7, 0x08, 0x5b, 0x0a, 0x00, 0x00, 0x01,
-    0x08, 0x00, 0x27, 0x47, 0x9c, 0xbd, 0x0a, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
 
 /* For modify */
 
@@ -57,6 +49,7 @@ uchar* modify_packet(uchar* buffer, uint& size);
 uchar* modify_nmap(uchar* buffer, uint& size);
 ushort ip_sum(uchar *buffer);
 ushort tcp_sum(uchar *buffer, ushort tcp_len);
+ushort icmp_sum(uchar *buffer);
 void get_os_params(os_sig os, bool type_param, ushort &win_size, uchar &ttl, uchar &df_bit,
                    std::vector<uchar> &options);
 
@@ -171,10 +164,10 @@ int mw::start_capturing()
      */
     get_os_params(os, 0, syn_win_size, ttl, syn_df_bit, syn_options);
     get_os_params(os, 1, syn_ack_win_size, ttl, syn_ack_df_bit, syn_ack_options);
-//    qDebug() << os.s_params;
-//    qDebug() << hex << "syn:     " << syn_options;
-//    qDebug() << os.sa_params;
-//    qDebug() << hex << "syn-ack: " << syn_ack_options;
+    //    qDebug() << os.s_params;
+    //    qDebug() << hex << "syn:     " << syn_options;
+    //    qDebug() << os.sa_params;
+    //    qDebug() << hex << "syn-ack: " << syn_ack_options;
 
 
     /* cmd -> GUI */
@@ -537,6 +530,7 @@ int capture_forward_thread(in_out_adapter& adapter)
                             //                            qDebug() << "Modify one host!";
                             uchar* new_pkt = modify_packet((uchar*)pkt_data, header->caplen);
                             pkt_data = new_pkt;
+
                         }
                 }
                 else {
@@ -548,19 +542,21 @@ int capture_forward_thread(in_out_adapter& adapter)
 
                 /* ============================== */
 
-                qDebug() << ">> Len: " << header->caplen;
+                qDebug() << ">> Len: " << header->caplen << "ID: " << hex << pkt_data[0x12] << pkt_data[0x13] << dec;
             }
             else {
-                printf("<< Len: %u\n", header->caplen);
+                qDebug("<< Len: %u\n", header->caplen);
             }
 
             /* === WINDOWS === */
             /* LeaveCriticalSection(&print_cs); */
             g_mutex.unlock();
 
+
             /*
-                                     * Send the just received packet to the output adaper
-                                     */
+             * Send the just received packet to the output adaper
+             */
+
             if(pcap_sendpacket(ad_couple->output_adapter, pkt_data, header->caplen) != 0)
             {
                 /* === WINDOWS === */
@@ -711,7 +707,7 @@ uchar* modify_packet(uchar* buffer, uint &size)
                 /* check SYN flag */
                 /* ------------- LEN |R  NCEUAPRSF ---- */
                 if ((tcp_flags & 0b0000000000000010) == 0b0000000000000010) {
-//                if (false) {
+                    //                if (false) {
                     qDebug()<< "SYN!";
                     /* -- Recheck IP DF-bit -- */
                     if (syn_df_bit)
@@ -730,7 +726,7 @@ uchar* modify_packet(uchar* buffer, uint &size)
 
                 /* check SYN,ACK flag */
                 if ((tcp_flags & 0b0000000000010010) == 0b0000000000010010) {
-//                if (false) {
+                    //                if (false) {
                     qDebug()<< "SYN-ACK!";
                     /* -- Recheck IP DF-bit -- */
                     if (syn_ack_df_bit)
@@ -750,7 +746,6 @@ uchar* modify_packet(uchar* buffer, uint &size)
                 size = ip_size + 14 - (tcp_options_size) + new_options_size;
 
                 /* Change TCP size */
-
                 short delta = new_options_size -  tcp_options_size;
                 tcp_hdr_size += (char)delta;
                 tcp_hdr_size /= 4;
@@ -759,20 +754,91 @@ uchar* modify_packet(uchar* buffer, uint &size)
                     buffer[0x2e] = buffer[0x2e] | ((tcp_hdr_size << 4) & 0xf0);
                 }
 
+                //                /* Change Packet size */
+                //                size += delta;
+
                 /* Change IP size */
                 ip_size += new_options_size -  tcp_options_size;
                 buffer[0x10] = ip_size & 0xff00;
                 buffer[0x11] = ip_size & 0x00ff;
-
             }
-
-
-            /* TCP checksum */
-            ushort sum = tcp_sum(buffer, ip_size - (buffer[0x0e]  & 0b00001111) * 4);
-            buffer[0x32] = (uchar)((sum & 0xff00) >> 8);
-            buffer[0x33] = (uchar) (sum & 0x00ff);
-
             /* -- TCP end -- */
+
+            /* -- HTTP -- */
+            else {
+
+                int len_template = strlen("User-Agent: ");
+                char user_agent[] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.163 Safari/537.36 OPR/67.0.3575.137";
+                int len_user_agent = strlen(user_agent);
+
+                char *temp = new char[10];
+                strncpy(temp, (char*)(buffer + 0x36), 10);
+                qDebug() << "HTTP?:   " << temp;
+
+                if (strcmp(temp, "GET / HTTP") == 0) {
+                    qDebug() << "TRUE!!!";
+                    char *http_start = (char*)(buffer + 0x36);
+
+
+                    /* Search pos of start/end User-agent */
+                    char* start_agent = strstr(http_start, "User-Agent: ");
+                    start_agent += len_template;
+                    char* end_agent = strstr(start_agent, "\r\n");
+
+                    //                    strncpy(temp, start_agent, 10);
+                    //                    qDebug() << "U/Ag?: " << temp;
+
+                    int size_begin = start_agent - (char*)buffer - 12;
+                    int size_middle = end_agent - start_agent;
+                    qDebug() << "IP_SIZE = " << ip_size;
+                    int size_end = ip_size - size_begin- size_middle;
+
+                    /* Insert new User-agent */
+                    uchar* temp_buf = new uchar [size_end];
+                    //                    strncpy(temp_buf, (char*)buffer, start_agent - (char*)buffer);
+
+                    qDebug() << "======== OLD =============\n" << http_start;
+
+                    //                    strcpy(temp_buf, end_agent);
+
+                    qDebug() << "Start    = " << size_begin;
+                    qDebug() << "Middle   = " << size_middle;
+                    qDebug() << "Size end = " << size_end;
+                    qDebug() << "Sum      = " << size_begin + size_middle + size_end;
+
+                    memcpy(temp_buf, end_agent, size_end);
+                    memcpy(start_agent, user_agent, len_user_agent);
+                    memcpy(start_agent + len_user_agent, temp_buf, size_end);
+
+                    //                    strncpy((char*)temp_buf, end_agent, size_end);
+                    //                    strncpy(start_agent, user_agent, len_user_agent);
+                    //                    strncpy(start_agent + len_user_agent, (char*)temp_buf, size_end);
+                    buffer[size_begin + len_template + len_user_agent + size_end] = 0x0d;
+                    buffer[size_begin + len_template + len_user_agent + size_end + 1] = 0x0a;
+                    size += len_user_agent - size_middle;
+
+                    buffer[size] = '\0';
+
+                    /* Change IP size */
+                    ip_size += len_user_agent - size_middle;
+                    buffer[0x10] = (ip_size & 0xff00) >> 8;
+                    buffer[0x11] = ip_size & 0x00ff;
+
+
+                    /* Change packet len */
+                    qDebug() << "======== NEW =============\n" << http_start;
+
+                    //                    size -= 10;
+                    qDebug() << "NEW SIZE    = " << size;
+                    delete[] temp_buf;
+                    delete[] temp;
+                }
+
+
+                //                delete[] temp;
+            }
+            /* -- HTTP end -- */
+
         }
         else
             /* -- ICMP -- */
@@ -781,17 +847,33 @@ uchar* modify_packet(uchar* buffer, uint &size)
                 /* -- ICMP  end -- */
             }
 
+        /* TCP checksum */
+        ushort sum = tcp_sum(buffer, ip_size - (buffer[0x0e]  & 0b00001111) * 4);
+        buffer[0x32] = (uchar)((sum & 0xff00) >> 8);
+        buffer[0x33] = (uchar) (sum & 0x00ff);
+
         /* -- IP checksum -- */
         /* This param will re-count after TCP check,
          * because IP DF-bit maybe will changed there
          */
 
-        unsigned short sum;
+        //        unsigned short sum;
         sum = ip_sum(buffer);
         buffer[24] = (unsigned char)((sum & 0xff00) >> 8);
         buffer[25] = (unsigned char) (sum & 0x00ff);
         /* -- IP end -- */
+
+        if (buffer[0x17]  == 0x01) {
+
+            /* -- ICMP -- */
+            /* -- ICMP  end -- */
+            sum = icmp_sum(buffer);
+            buffer[0x24] = (uchar)((sum & 0xff00) >> 8);
+            buffer[0x25] = (uchar) (sum & 0x00ff);
+            qDebug() << "ICMP = " << hex << sum;
+        }
     }
+
     return buffer;
 }
 
@@ -835,7 +917,7 @@ ushort tcp_sum(uchar *buffer, ushort tcp_len)
     return (~sum);
 }
 
-ushort ip_sum (uchar * buffer)
+ushort ip_sum (uchar *buffer)
 {
     uchar start = 0x0e;
     uchar *ip_header = buffer + start; // START of IP HEADER in packet
@@ -852,7 +934,24 @@ ushort ip_sum (uchar * buffer)
         sum = (sum & 0xFFFF) + (sum >> 16);
     return ~sum;
 }
+ushort icmp_sum(uchar *buffer)
+{
+    uchar start = 0x22;
+    uchar *icmp_header = buffer + start; // START of ICMP HEADER in packet
+    uint sum = 0;
+    ushort icmp_size = ((buffer[0x10] << 8) & 0xff00 ) | (buffer[0x11] & 0x00ff);
+    icmp_size -= (buffer[0x0e] & 0b00001111) * 4;
+    for (ushort i = 0; i < icmp_size; i += 2)
+        sum += ((icmp_header[i] << 8) & 0xff00)
+                | (icmp_header[i + 1] & 0x00ff);
 
+    // Simple sub the current checksum that was already add
+    sum -= ((icmp_header[2] << 8) & 0xff00) | (icmp_header[3] & 0x00ff);
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
 
 void get_os_params(os_sig os, bool type_param, ushort &win_size,
                    uchar &ttl, uchar &df_bit, std::vector<uchar> &options)
@@ -900,7 +999,7 @@ void get_os_params(os_sig os, bool type_param, ushort &win_size,
         case short('T'):
         {
             options.push_back(0x08);
-            options.push_back(0x10);
+            options.push_back(0x0a);
             options.insert(options.end(), 2, 0x00);
             options.push_back(0xe2);
             options.push_back(0x40);
@@ -925,8 +1024,9 @@ void get_os_params(os_sig os, bool type_param, ushort &win_size,
         }
     }
 
+    //    qDebug() << "HERE = " << hex << options;
     if (options.size() != options_size - 40)
-        QMessageBox::critical(nullptr, "Error", "Error size options!");
+        QMessageBox::critical(nullptr, "Error", QString("Error size options!\n%1\n%2").arg(QString::number(options.size()), QString::number(options_size -  40)));
 }
 
 pcap_if_t *print_all_devs(bool debug, int &count)
